@@ -14,59 +14,89 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 
 app.use(express.static(path.join(__dirname, 'public')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/watch', (req, res) => res.sendFile(path.join(__dirname, 'public', 'watch.html')));
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// Viewers can query current state on load
+app.get('/api/status', (req, res) => {
+  res.json({ broadcasting: isBroadcasting, viewers: viewers.size });
 });
 
-app.get('/watch', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'watch.html'));
-});
-
-// State
+// ── State ────────────────────────────────────────────────────────────────────
 let broadcasterId = null;
+let isBroadcasting = false;
 const viewers = new Set();
 
-function viewerCount() {
-  return viewers.size;
+function emitViewerCount() {
+  io.emit('viewer-count', viewers.size);
 }
 
-function broadcastViewerCount() {
-  io.emit('viewer-count', viewerCount());
-}
-
+// ── Socket ───────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log(`[+] Connected: ${socket.id}`);
+  console.log(`[+] ${socket.id}`);
 
-  // --- Broadcaster registers ---
+  // ── BROADCASTER ─────────────────────────────────────────────────────────────
+
   socket.on('register-broadcaster', () => {
+    // If someone else is already broadcasting, tell this client to go watch
+    if (broadcasterId && isBroadcasting && broadcasterId !== socket.id) {
+      console.log(`[BROADCAST] Active broadcast exists — redirecting ${socket.id} to /watch`);
+      socket.emit('redirect-to-viewer');
+      return;
+    }
+
     broadcasterId = socket.id;
-    socket.join('broadcaster');
-    console.log(`[BROADCAST] Broadcaster registered: ${socket.id}`);
-    socket.emit('broadcaster-ready');
-    // Notify existing viewers that a broadcaster is now available
-    socket.to('viewers').emit('broadcaster-available');
-    broadcastViewerCount();
+    socket.join('broadcaster-room');
+    console.log(`[BROADCAST] Registered: ${socket.id}`);
+    socket.emit('broadcaster-registered');
+    emitViewerCount();
   });
 
-  // --- Viewer joins ---
+  // Broadcaster has a real stream and is ready to send offers
+  socket.on('start-broadcast', () => {
+    if (socket.id !== broadcasterId) return;
+    isBroadcasting = true;
+    console.log(`[BROADCAST] Streaming started`);
+
+    // Notify all waiting viewers the stream is live
+    socket.to('viewers-room').emit('broadcaster-available');
+
+    // Tell broadcaster about every viewer already waiting so it creates offers
+    viewers.forEach(viewerId => {
+      socket.emit('viewer-joined', { viewerId });
+    });
+
+    emitViewerCount();
+  });
+
+  // Broadcaster explicitly stopped
+  socket.on('stop-broadcast', () => {
+    if (socket.id !== broadcasterId) return;
+    isBroadcasting = false;
+    console.log(`[BROADCAST] Streaming stopped`);
+    io.to('viewers-room').emit('broadcaster-left');
+    emitViewerCount();
+  });
+
+  // ── VIEWER ──────────────────────────────────────────────────────────────────
+
   socket.on('register-viewer', () => {
     viewers.add(socket.id);
-    socket.join('viewers');
-    console.log(`[VIEW] Viewer joined: ${socket.id} (total: ${viewerCount()})`);
-    broadcastViewerCount();
+    socket.join('viewers-room');
+    console.log(`[VIEW] +${socket.id}  (${viewers.size} total)`);
+    emitViewerCount();
 
-    if (broadcasterId) {
-      // Tell viewer a broadcaster exists
+    if (broadcasterId && isBroadcasting) {
+      // Stream is live: tell viewer to get ready and tell broadcaster a new viewer arrived
       socket.emit('broadcaster-available');
-      // Tell broadcaster a new viewer wants a stream
       io.to(broadcasterId).emit('viewer-joined', { viewerId: socket.id });
     } else {
       socket.emit('no-broadcaster');
     }
   });
 
-  // --- WebRTC signaling relay ---
+  // ── SIGNALING RELAY ──────────────────────────────────────────────────────────
+
   socket.on('offer', ({ targetId, sdp }) => {
     io.to(targetId).emit('offer', { fromId: socket.id, sdp });
   });
@@ -79,31 +109,32 @@ io.on('connection', (socket) => {
     io.to(targetId).emit('ice-candidate', { fromId: socket.id, candidate });
   });
 
-  // --- Disconnect ---
+  // ── DISCONNECT ───────────────────────────────────────────────────────────────
+
   socket.on('disconnect', () => {
-    console.log(`[-] Disconnected: ${socket.id}`);
+    console.log(`[-] ${socket.id}`);
 
     if (socket.id === broadcasterId) {
       broadcasterId = null;
-      console.log('[BROADCAST] Broadcaster left');
-      io.to('viewers').emit('broadcaster-left');
-      broadcastViewerCount();
+      isBroadcasting = false;
+      console.log('[BROADCAST] Broadcaster disconnected');
+      io.to('viewers-room').emit('broadcaster-left');
+      emitViewerCount();
     }
 
     if (viewers.has(socket.id)) {
       viewers.delete(socket.id);
-      console.log(`[VIEW] Viewer left: ${socket.id} (total: ${viewerCount()})`);
+      console.log(`[VIEW] -${socket.id}  (${viewers.size} total)`);
       if (broadcasterId) {
         io.to(broadcasterId).emit('viewer-left', { viewerId: socket.id });
       }
-      broadcastViewerCount();
+      emitViewerCount();
     }
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n✅ LAN Streamer running`);
-  console.log(`   Local:   http://localhost:${PORT}`);
-  console.log(`   Network: http://<YOUR-LAN-IP>:${PORT}`);
-  console.log(`   Watch:   http://<YOUR-LAN-IP>:${PORT}/watch\n`);
+  console.log(`\n✅  LAN Streamer listo`);
+  console.log(`    Emisor:     http://localhost:${PORT}`);
+  console.log(`    Receptor:   http://<TU-IP-LAN>:${PORT}/watch\n`);
 });
