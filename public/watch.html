@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LAN Streamer — Ver</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #000;
+      --overlay-bg: rgba(0,0,0,0.72);
+      --accent: #4f6ef7;
+      --text: #e8eaf0;
+      --text-muted: #8b8fa8;
+      --green: #3ecf8e;
+      --danger: #e05252;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+    }
+
+    /* ── Video fullscreen ───────────────────────────── */
+    #video-container {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+
+    #stream {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    /* ── Overlay (shown when no stream) ───────────────── */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      background: #0f1117;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+      text-align: center;
+      padding: 2rem;
+      transition: opacity 0.4s;
+    }
+
+    #overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .overlay-icon {
+      opacity: 0.35;
+    }
+
+    #overlay h1 {
+      font-size: clamp(1.2rem, 4vw, 1.8rem);
+      font-weight: 700;
+    }
+
+    #overlay-msg {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      max-width: 360px;
+      line-height: 1.6;
+    }
+
+    .spinner {
+      width: 32px;
+      height: 32px;
+      border: 3px solid #2e3248;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── HUD (shown while streaming) ─────────────────── */
+    #hud {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 0.75rem 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6) 0%, transparent 100%);
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+
+    #hud.visible { opacity: 1; }
+
+    .live-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--danger);
+      animation: pulse 1.5s infinite;
+      flex-shrink: 0;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    #hud-text {
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #fff;
+    }
+
+    /* ── Fullscreen button ─────────────────────────── */
+    #btn-fullscreen {
+      position: fixed;
+      bottom: 1.25rem;
+      right: 1.25rem;
+      background: var(--overlay-bg);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #fff;
+      border-radius: 8px;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+
+    #btn-fullscreen:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    #btn-fullscreen.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    #btn-fullscreen:hover { background: rgba(0,0,0,0.85); }
+
+    /* Screen-reader only */
+    .sr-only {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0,0,0,0);
+      white-space: nowrap; border: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Video -->
+  <div id="video-container" aria-label="Área de reproducción del stream">
+    <video id="stream" autoplay playsinline muted
+           aria-label="Stream de pantalla remota"></video>
+  </div>
+
+  <!-- Overlay when no stream -->
+  <div id="overlay" role="status" aria-live="polite">
+    <svg class="overlay-icon" width="56" height="56" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+      <rect x="2" y="3" width="20" height="14" rx="2"/>
+      <line x1="8" y1="21" x2="16" y2="21"/>
+      <line x1="12" y1="17" x2="12" y2="21"/>
+    </svg>
+    <h1 id="overlay-title">Esperando emisión…</h1>
+    <p id="overlay-msg">Conéctate a la red local y abre el emisor en tu ordenador.</p>
+    <div class="spinner" id="spinner" aria-hidden="true"></div>
+  </div>
+
+  <!-- HUD while live -->
+  <div id="hud" aria-hidden="true">
+    <span class="live-dot"></span>
+    <span id="hud-text">En directo</span>
+  </div>
+
+  <!-- Fullscreen button -->
+  <button id="btn-fullscreen" aria-label="Pantalla completa">⛶ Pantalla completa</button>
+
+  <!-- SR live region -->
+  <div aria-live="assertive" aria-atomic="true" class="sr-only" id="sr-live"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const videoEl    = document.getElementById('stream');
+    const overlay    = document.getElementById('overlay');
+    const overlayTitle = document.getElementById('overlay-title');
+    const overlayMsg = document.getElementById('overlay-msg');
+    const spinner    = document.getElementById('spinner');
+    const hud        = document.getElementById('hud');
+    const btnFs      = document.getElementById('btn-fullscreen');
+    const srLive     = document.getElementById('sr-live');
+
+    let pc = null;
+    let reconnectTimer = null;
+    const RECONNECT_DELAY = 3000;
+
+    const iceConfig = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+    };
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    function announce(msg) {
+      srLive.textContent = '';
+      requestAnimationFrame(() => { srLive.textContent = msg; });
+    }
+
+    function showOverlay(title, msg, showSpinner = true) {
+      overlayTitle.textContent = title;
+      overlayMsg.textContent   = msg;
+      spinner.style.display    = showSpinner ? 'block' : 'none';
+      overlay.classList.remove('hidden');
+      hud.classList.remove('visible');
+      btnFs.classList.remove('visible');
+      hud.setAttribute('aria-hidden', 'true');
+    }
+
+    function hideOverlay() {
+      overlay.classList.add('hidden');
+      hud.classList.add('visible');
+      btnFs.classList.add('visible');
+      hud.setAttribute('aria-hidden', 'false');
+    }
+
+    function closePeer() {
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+    }
+
+    // ── Socket ────────────────────────────────────────────────────────────────
+
+    const socket = io({ reconnection: true, reconnectionDelay: RECONNECT_DELAY });
+
+    socket.on('connect', () => {
+      showOverlay('Buscando emisor…', 'Conectado al servidor. Esperando que se inicie una emisión.', true);
+      socket.emit('register-viewer');
+    });
+
+    socket.on('disconnect', () => {
+      showOverlay('Reconectando…', 'Se perdió la conexión con el servidor.', true);
+      announce('Conexión perdida. Reconectando…');
+      closePeer();
+      videoEl.srcObject = null;
+    });
+
+    socket.on('no-broadcaster', () => {
+      showOverlay('Sin emisor activo', 'No hay ningún ordenador emitiendo ahora mismo. Esta página se actualizará cuando comience una emisión.', true);
+      announce('No hay emisor activo. Esperando…');
+    });
+
+    socket.on('broadcaster-available', () => {
+      showOverlay('Conectando…', 'Emisor detectado. Estableciendo conexión…', true);
+      announce('Emisor detectado. Conectando…');
+    });
+
+    socket.on('broadcaster-left', () => {
+      showOverlay('Emisión finalizada', 'El emisor ha detenido la transmisión.', false);
+      announce('La emisión ha terminado.');
+      closePeer();
+      videoEl.srcObject = null;
+      // Poll: try re-joining in case broadcaster comes back
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => socket.emit('register-viewer'), 5000);
+    });
+
+    // Receive offer from broadcaster
+    socket.on('offer', async ({ fromId, sdp }) => {
+      closePeer();
+      pc = new RTCPeerConnection(iceConfig);
+
+      pc.ontrack = ({ streams }) => {
+        if (streams[0]) {
+          videoEl.srcObject = streams[0];
+          videoEl.play().catch(() => {
+            // Autoplay blocked — unmute to satisfy policy and retry
+            videoEl.muted = true;
+            videoEl.play();
+          });
+          hideOverlay();
+          announce('Emisión iniciada. Reproduciendo stream.');
+        }
+      };
+
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate) {
+          socket.emit('ice-candidate', { targetId: fromId, candidate });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc && pc.connectionState === 'failed') {
+          showOverlay('Error de conexión', 'No se pudo establecer la conexión WebRTC.', false);
+          announce('Error de conexión WebRTC.');
+        }
+        if (pc && pc.connectionState === 'disconnected') {
+          showOverlay('Reconectando stream…', 'Conexión interrumpida.', true);
+        }
+      };
+
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('answer', { targetId: fromId, sdp: pc.localDescription });
+      } catch (e) {
+        showOverlay('Error', 'No se pudo procesar la oferta WebRTC: ' + e.message, false);
+        announce('Error al conectar con el emisor.');
+      }
+    });
+
+    socket.on('ice-candidate', async ({ candidate }) => {
+      if (!pc || !candidate) return;
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Non-fatal
+      }
+    });
+
+    // ── Fullscreen ────────────────────────────────────────────────────────────
+
+    btnFs.addEventListener('click', () => {
+      const el = document.documentElement;
+      if (!document.fullscreenElement) {
+        el.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    });
+
+    document.addEventListener('fullscreenchange', () => {
+      btnFs.textContent = document.fullscreenElement ? '✕ Salir' : '⛶ Pantalla completa';
+      btnFs.setAttribute('aria-label', document.fullscreenElement ? 'Salir de pantalla completa' : 'Pantalla completa');
+    });
+  </script>
+</body>
+</html>
