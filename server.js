@@ -9,6 +9,9 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
   transports: ['websocket', 'polling'],
+  // LAN: detect silent disconnects faster than the 25s/20s defaults
+  pingInterval: 10000,
+  pingTimeout:   5000,
 });
 
 const PORT = process.env.PORT || 3000;
@@ -28,7 +31,8 @@ let isBroadcasting = false;
 const viewers = new Set();
 
 function emitViewerCount() {
-  io.emit('viewer-count', viewers.size);
+  // Only the broadcaster cares about viewer count — don't broadcast to all sockets
+  io.to('broadcaster-room').emit('viewer-count', viewers.size);
 }
 
 // ── Socket ───────────────────────────────────────────────────────────────────

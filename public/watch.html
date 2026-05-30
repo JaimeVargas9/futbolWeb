@@ -340,20 +340,24 @@
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
-    let pc         = null;
-    let retryTimer = null;
+    let pc               = null;
+    let retryTimer       = null;
+    let audioFallback    = null; // timer ID for the audio-fallback setTimeout
 
     const iceConfig = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
+      // LAN-only: no STUN. External STUN keepalives go over the home router —
+      // any internet congestion spike makes Chrome think the ICE path is failing,
+      // causing stream stutters. Direct host candidates are sufficient on LAN.
+      iceServers:    [],
+      bundlePolicy:  'max-bundle',
+      rtcpMuxPolicy: 'require',
     };
 
-    // ── SDP patcher (same as broadcaster) ────────────────────────────────────
+    // ── SDP patcher — kept in sync with broadcaster version ──────────────────
     function patchSdpForLAN(sdp) {
       const MAX_KBPS   = 50_000;
       const START_KBPS = 15_000;
+      const MIN_KBPS   =  8_000;
       const lines = sdp.split('\r\n');
       const out   = [];
       let inVideo = false, bDone = false;
@@ -377,12 +381,15 @@
         if (inVideo && line.startsWith('b=')) continue;
         out.push(line);
         if (inVideo && !bDone && line.startsWith('m=video')) {
-          out.push(`b=AS:${MAX_KBPS}`); out.push(`b=TIAS:${MAX_KBPS * 1000}`); bDone = true;
+          out.push(`b=AS:${MAX_KBPS}`);
+          out.push(`b=TIAS:${MAX_KBPS * 1000}`);
+          out.push('a=framerate:60');
+          bDone = true;
         }
         if (inVideo && line.startsWith('a=fmtp:')) {
           const m = line.match(/^a=fmtp:(\d+) (.*)$/);
           if (m && videoPTs.has(m[1]) && !m[2].includes('x-google-max-bitrate')) {
-            out[out.length-1] = `a=fmtp:${m[1]} ${m[2]};x-google-start-bitrate=${START_KBPS};x-google-max-bitrate=${MAX_KBPS}`;
+            out[out.length-1] = `a=fmtp:${m[1]} ${m[2]};x-google-start-bitrate=${START_KBPS};x-google-min-bitrate=${MIN_KBPS};x-google-max-bitrate=${MAX_KBPS}`;
             injected.add(m[1]);
           }
         }
@@ -391,7 +398,7 @@
           if (m && videoPTs.has(m[1]) && !hasFmtp.has(m[1]) && !injected.has(m[1])) {
             const codec = m[2].toLowerCase();
             if (['vp8','vp9','h264','av1'].some(c => codec.startsWith(c))) {
-              out.push(`a=fmtp:${m[1]} x-google-start-bitrate=${START_KBPS};x-google-max-bitrate=${MAX_KBPS}`);
+              out.push(`a=fmtp:${m[1]} x-google-start-bitrate=${START_KBPS};x-google-min-bitrate=${MIN_KBPS};x-google-max-bitrate=${MAX_KBPS}`);
               injected.add(m[1]);
             }
           }
@@ -512,6 +519,10 @@
     // ── Peer ─────────────────────────────────────────────────────────────────
 
     function closePeer() {
+      // Cancel any pending audio-fallback timer so a stale stream reference
+      // can never be attached to the audio element after closePeer() nulls it.
+      clearTimeout(audioFallback);
+      audioFallback = null;
       if (pc) { pc.close(); pc = null; }
       videoEl.srcObject = null;
       audioEl.srcObject = null;
@@ -521,7 +532,8 @@
 
     // ── Socket ────────────────────────────────────────────────────────────────
 
-    const socket = io({ reconnection: true, reconnectionDelay: 2000, reconnectionDelayMax: 5000 });
+    // Faster reconnection for LAN — 1 s initial, 3 s max (was 2 s / 5 s)
+    const socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionDelayMax: 3000 });
 
     socket.on('connect', () => {
       clearTimeout(retryTimer);
@@ -557,13 +569,13 @@
       closePeer();
       pc = new RTCPeerConnection(iceConfig);
 
-      // ontrack fires once per track (video, then audio).
-      // We wait until the stream has both before doing anything.
-      let tracksReceived = 0;
-
-      pc.ontrack = ({ track, streams }) => {
+      pc.ontrack = ({ track, streams, receiver }) => {
         if (!streams[0]) return;
-        tracksReceived++;
+
+        // On LAN the real jitter is < 1 ms. Tell the browser to drain its
+        // jitter buffer immediately instead of waiting 50-150 ms — this is
+        // the main fix for accumulated lag during long streaming sessions.
+        try { receiver.jitterBufferTarget = 0; } catch { }
 
         if (track.kind === 'video') {
           // Video always plays muted — no policy issues
@@ -572,23 +584,25 @@
           videoEl.play().catch(() => {});
           hideOverlay();
           announce('Stream conectado.');
+
+          // Fallback: some environments don't fire a separate audio ontrack event.
+          // Schedule a check — cancelled immediately if the audio track arrives first.
+          const capturedStream = streams[0];
+          audioFallback = setTimeout(() => {
+            audioFallback = null;
+            if (capturedStream.getAudioTracks().length > 0 && !audioEl.srcObject) {
+              attachAudio(capturedStream);
+            }
+          }, 500);
         }
 
         if (track.kind === 'audio') {
-          // Attach audio to the dedicated <audio> element
+          // Audio track arrived explicitly — cancel the fallback timer so the
+          // same stream isn't attached twice, and so a stale timer from a previous
+          // offer can never overwrite the new srcObject.
+          clearTimeout(audioFallback);
+          audioFallback = null;
           attachAudio(streams[0]);
-        }
-
-        // Fallback: if we get a single combined track (some browsers/environments)
-        // and no explicit audio track fires, attach audio from the full stream
-        if (tracksReceived === 1 && track.kind === 'video') {
-          // Attempt audio attachment from full stream after a short delay
-          // (in case audio track event follows immediately)
-          setTimeout(() => {
-            if (streams[0].getAudioTracks().length > 0 && !audioEl.srcObject) {
-              attachAudio(streams[0]);
-            }
-          }, 500);
         }
       };
 

@@ -362,10 +362,15 @@
     let localStream = null;
 
     const iceConfig = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
+      // LAN-only: no STUN servers. External STUN introduces internet dependency —
+      // Chrome sends keepalive packets to stun.l.google.com during the entire
+      // session; any home-router congestion delays them, Chrome marks the ICE
+      // candidate pair as failing, and the stream stutters. On a home LAN, host
+      // candidates (local IPs) are all that's needed for a direct connection.
+      iceServers: [],
+      bundlePolicy:        'max-bundle',
+      rtcpMuxPolicy:       'require',
+      iceCandidatePoolSize: 2,
     };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -383,6 +388,7 @@
     function patchSdpForLAN(sdp) {
       const MAX_KBPS   = 50_000;  // 50 Mbps — no quality concessions on LAN
       const START_KBPS = 15_000;  // 15 Mbps start → instant HD quality
+      const MIN_KBPS   =  8_000;  // 8 Mbps floor — REMB/TWCC cannot drop below this
 
       const lines = sdp.split('\r\n');
       const out   = [];
@@ -420,10 +426,11 @@
 
         out.push(line);
 
-        // Inject b= lines immediately after m=video
+        // Inject b= and framerate lines immediately after m=video
         if (inVideo && !bDone && line.startsWith('m=video')) {
           out.push(`b=AS:${MAX_KBPS}`);
           out.push(`b=TIAS:${MAX_KBPS * 1000}`);
+          out.push('a=framerate:60');
           bDone = true;
         }
 
@@ -433,7 +440,7 @@
           if (m && videoPTs.has(m[1]) && !m[2].includes('x-google-max-bitrate')) {
             // Replace the line we just pushed with the augmented version
             out[out.length - 1] =
-              `a=fmtp:${m[1]} ${m[2]};x-google-start-bitrate=${START_KBPS};x-google-max-bitrate=${MAX_KBPS}`;
+              `a=fmtp:${m[1]} ${m[2]};x-google-start-bitrate=${START_KBPS};x-google-min-bitrate=${MIN_KBPS};x-google-max-bitrate=${MAX_KBPS}`;
             injected.add(m[1]);
           }
         }
@@ -444,7 +451,7 @@
           if (m && videoPTs.has(m[1]) && !hasFmtp.has(m[1]) && !injected.has(m[1])) {
             const codec = m[2].toLowerCase();
             if (['vp8','vp9','h264','av1'].some(c => codec.startsWith(c))) {
-              out.push(`a=fmtp:${m[1]} x-google-start-bitrate=${START_KBPS};x-google-max-bitrate=${MAX_KBPS}`);
+              out.push(`a=fmtp:${m[1]} x-google-start-bitrate=${START_KBPS};x-google-min-bitrate=${MIN_KBPS};x-google-max-bitrate=${MAX_KBPS}`);
               injected.add(m[1]);
             }
           }
@@ -477,28 +484,46 @@
     //   On LAN there is no real congestion so this is safe.
     async function applyEncodingParams(pc) {
       for (const sender of pc.getSenders()) {
-        if (sender.track?.kind !== 'video') continue;
-        try {
-          const params = sender.getParameters();
-          if (!params.encodings?.length) params.encodings = [{}];
-          Object.assign(params.encodings[0], {
-            maxBitrate:            50_000_000, // 50 Mbps — no limits on LAN
-            maxFramerate:          60,
-            priority:              'high',
-            networkPriority:       'high',
-            degradationPreference: 'disabled', // never degrade quality or fps
-          });
-          await sender.setParameters(params);
-        } catch {
-          // 'disabled' not supported on older Chrome — fall back to maintain-resolution
+        const kind = sender.track?.kind;
+        if (!kind) continue;
+
+        if (kind === 'video') {
           try {
             const params = sender.getParameters();
-            if (params.encodings?.length) {
-              params.encodings[0].maxBitrate = 50_000_000;
-              params.encodings[0].maxFramerate = 60;
-              params.encodings[0].degradationPreference = 'maintain-resolution';
-              await sender.setParameters(params);
-            }
+            if (!params.encodings?.length) params.encodings = [{}];
+            Object.assign(params.encodings[0], {
+              maxBitrate:            50_000_000, // 50 Mbps — no limits on LAN
+              maxFramerate:          60,
+              priority:              'high',
+              networkPriority:       'high',
+              degradationPreference: 'disabled', // never degrade quality or fps
+            });
+            await sender.setParameters(params);
+          } catch {
+            // 'disabled' not supported on older Chrome — fall back to maintain-resolution
+            try {
+              const params = sender.getParameters();
+              if (params.encodings?.length) {
+                params.encodings[0].maxBitrate = 50_000_000;
+                params.encodings[0].maxFramerate = 60;
+                params.encodings[0].degradationPreference = 'maintain-resolution';
+                await sender.setParameters(params);
+              }
+            } catch { /* ignore */ }
+          }
+        }
+
+        if (kind === 'audio') {
+          // Elevate audio priority so the network scheduler favours it during
+          // moments of congestion — avoids audio glitches when video bitrate spikes.
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings?.length) params.encodings = [{}];
+            Object.assign(params.encodings[0], {
+              priority:        'high',
+              networkPriority: 'high',
+            });
+            await sender.setParameters(params);
           } catch { /* ignore */ }
         }
       }
@@ -530,7 +555,30 @@
       if (!localStream?.active) return;
 
       const pc = createPeer(viewerId);
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      // Use addTransceiver instead of addTrack so that sendEncodings (including
+      // maxFramerate:60) are negotiated INTO the offer itself — not applied
+      // post-connection via setParameters. This is the key fix for receivers
+      // seeing 30 fps: the framerate is established during SDP exchange, before
+      // any ICE completes, so the encoder never starts at a lower rate.
+      for (const track of localStream.getTracks()) {
+        const init = { streams: [localStream], direction: 'sendonly' };
+        if (track.kind === 'video') {
+          init.sendEncodings = [{
+            maxBitrate:      50_000_000,
+            maxFramerate:    60,
+            priority:        'high',
+            networkPriority: 'high',
+          }];
+        } else {
+          init.sendEncodings = [{
+            priority:        'high',
+            networkPriority: 'high',
+          }];
+        }
+        pc.addTransceiver(track, init);
+      }
+
       applyCodecPreference(pc);
 
       try {
@@ -608,6 +656,10 @@
 
       // 'detail' = encoder optimises for sharpness/text legibility (screen share ideal)
       videoTrack.contentHint = 'detail';
+
+      // 'music' = disable speech VAD/DTX on system audio — prevents silencing of
+      // non-voice content (game audio, music, notifications).
+      localStream.getAudioTracks().forEach(t => { t.contentHint = 'music'; });
 
       // Force 60 fps on the track (some browsers default to 15)
       try { await videoTrack.applyConstraints({ frameRate: { ideal: 60 } }); } catch { }
